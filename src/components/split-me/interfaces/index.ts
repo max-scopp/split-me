@@ -3,3 +3,5 @@ export interface IResizeEvent {
   divider: number;
   originalEvent: MouseEvent | TouchEvent;
 }
+
+export type Direction = 'horizontal' | 'vertical';

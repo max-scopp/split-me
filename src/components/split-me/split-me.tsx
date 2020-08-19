@@ -6,13 +6,15 @@ import {
   Element,
   Event,
   EventEmitter,
-  h
+  h,
+  forceUpdate
 } from '@stencil/core';
 
 import { Cancelable } from 'lodash';
 import throttle from 'lodash.throttle';
 
-import { IResizeEvent } from './interfaces';
+import { IResizeEvent, Direction } from './interfaces';
+import * as Utils from '../../utils/units';
 
 @Component({
   tag: 'split-me',
@@ -33,7 +35,7 @@ export class SplitMe {
    * The direction of the splitter.
    */
   @Prop()
-  d: 'horizontal' | 'vertical' = 'horizontal';
+  d: Direction = 'horizontal';
 
   /**
    * Prevent the splitter from being resized.
@@ -43,7 +45,10 @@ export class SplitMe {
 
   /**
    * The initial sizes of the slots.
-   * Acceptable formats are: `sizes="0.33, 0.67"` or `sizes="50%, 25%, 25%"`
+   * Acceptable formats for fractions are:
+   * `sizes="0.33, 0.67"` or `sizes="50%, 25%, 25%"`
+   * Acceptable formats for pixels are:
+   * `sizes="33px, 67px"` or `sizes="50rem, 25em, 25rem"`
    */
   @Prop()
   sizes: string | number[] = '';
@@ -112,23 +117,42 @@ export class SplitMe {
   maxSizesChanged: boolean = false;
 
   componentWillLoad() {
+    performance.mark('init-start');
     this.throttledResize = throttle(this.resize.bind(this), this.throttle);
-    // Validate the sizes attribute
-    let sizes: number[] = this.parseSizes(this.sizes);
-    if (sizes.length === this.n) {
-      this.slotEnd = this.assignedSlotEnd(sizes);
-    } else {
-      this.slotEnd = this.defaultSlotEnd(this.n);
+
+    this.calculateSizes();
+    console.log(
+      'bare-init',
+      (performance.measure('init-base', 'init-start') as any).duration
+    );
+    requestAnimationFrame(() => {
+      this.calculateSizes();
+      console.log(
+        'full-init',
+        (performance.measure('init-full', 'init-start') as any).duration
+      );
+    });
+  }
+
+  calculateSizes(onlyBoundaries?: boolean) {
+    if (!onlyBoundaries) {
+      // Validate the sizes attribute
+      let sizes: number[] = this.parseSizes(this.sizes, 'sizes');
+      if (sizes.length === this.n) {
+        this.slotEnd = this.assignedSlotEnd(sizes);
+      } else {
+        this.slotEnd = this.defaultSlotEnd(this.n);
+      }
     }
     // Validate the minSize attribute
-    let minSizes: number[] = this.parseSizes(this.minSizes);
+    let minSizes: number[] = this.parseSizes(this.minSizes, 'minSizes');
     if (minSizes.length === this.n) {
       this.minSizesArr = minSizes;
     } else {
       this.minSizesArr = this.defaultMinSizes(this.n);
     }
     // Validate the maxSize attribute
-    let maxSizes: number[] = this.parseSizes(this.maxSizes);
+    let maxSizes: number[] = this.parseSizes(this.maxSizes, 'maxSizes');
     if (maxSizes.length === this.n) {
       this.maxSizesArr = maxSizes;
     } else {
@@ -226,7 +250,72 @@ export class SplitMe {
     return maxSizes;
   }
 
-  parseSizes(sizesStr: string | number[]): number[] {
+  sizeToFraction(size: string): number {
+    const unitRegExp = /[^\d]+$/i;
+    const hasUnit = unitRegExp.test(String(size));
+
+    if (hasUnit) {
+      const [unit] = String(size)
+        .toLowerCase()
+        .match(unitRegExp);
+      switch (unit) {
+        case 'em': {
+          return Utils.emToFract(size, this.el, this.d);
+        }
+        case 'rem': {
+          return Utils.remToFract(size, this.el, this.d);
+        }
+        case 'px': {
+          return Utils.pxToFract(size, this.el, this.d);
+        }
+        default: {
+          console.warn(
+            `split-me: Provided unit "${unit}" is unknown or not supported.`
+          );
+        }
+      }
+    }
+
+    const percentRegex: RegExp = /^\s*\d+(\.\d*)?\%\s*$/;
+    const fracRegex: RegExp = /^\s*(0|1)(\.\d*)?\s*$/;
+
+    if (size.match(percentRegex)) {
+      return parseFloat(size) / 100;
+    } else if (size.match(fracRegex)) {
+      return parseFloat(size);
+    } else {
+      return 0;
+    }
+  }
+
+  /**
+   * TODO: Not sure if this is still required.
+   * @see sizeToFraction
+   * @param sizes
+   */
+  sizesToFractions(sizes: Array<string | number>): number[] {
+    if (!Array.isArray(sizes)) {
+      return [];
+    }
+
+    return sizes.map(size => this.sizeToFraction(String(size)));
+  }
+
+  /**
+   * Parses a "size".
+   * Unitless values are handled are fractions.
+   * Values with an unit are properly converted to pixel, internally.
+   * @example an font-size of 10px on your `:root` and an set size of 1.2rem, the size will be 12pixels.
+   * @param sizesStr
+   */
+  parseSizes(sizesStr: string | number[], source?: string): number[] {
+    const warnNotEven = () =>
+      console.warn(
+        `split-me: The sizes provided do not match the nth-child(s) expected. ${
+          source ? `Please validate the property/attribute "${source}".` : ''
+        }`
+      );
+
     if (!sizesStr) {
       return [];
     }
@@ -235,8 +324,9 @@ export class SplitMe {
 
     if (Array.isArray(sizesStr)) {
       if (sizesStr.length === this.n) {
-        return sizesStr;
+        return this.sizesToFractions(sizesStr);
       } else {
+        warnNotEven();
         return [];
       }
     }
@@ -247,8 +337,9 @@ export class SplitMe {
       const parsed = JSON.parse(sizesStr);
       if (Array.isArray(parsed)) {
         if (parsed.length === this.n) {
-          return parsed;
+          return this.sizesToFractions(parsed);
         } else {
+          warnNotEven();
           return [];
         }
       }
@@ -259,22 +350,11 @@ export class SplitMe {
 
     let sizesStrArr: string[] = sizesStr.split(',');
     if (sizesStrArr.length !== this.n) {
+      warnNotEven();
       return [];
     }
-    let sizes: number[] = [];
-    const percentRegex: RegExp = /^\s*\d+(\.\d*)?\%\s*$/;
-    const fracRegex: RegExp = /^\s*(0|1)(\.\d*)?\s*$/;
-    for (let i = 0; i < sizesStrArr.length; ++i) {
-      let str: string = sizesStrArr[i];
-      if (str.match(percentRegex)) {
-        sizes.push(parseFloat(str) / 100);
-      } else if (str.match(fracRegex)) {
-        sizes.push(parseFloat(str));
-      } else {
-        return [];
-      }
-    }
-    return sizes;
+
+    return this.sizesToFractions(sizesStrArr);
   }
 
   onDragStart(event: DragEvent, i: number) {
@@ -292,6 +372,13 @@ export class SplitMe {
       window.removeEventListener('mouseup', mouseUpListener);
     };
 
+    // TODO: Debounce would be more appropirate, but that's an additional dependency.
+    const windowResizeListener = throttle(() => {
+      this.calculateSizes(true);
+      forceUpdate(this.el);
+    }, 120);
+
+    window.addEventListener('resize', windowResizeListener);
     window.addEventListener('mousemove', mouseMoveListener);
     window.addEventListener('mouseup', mouseUpListener);
   }
@@ -318,6 +405,12 @@ export class SplitMe {
     let max = i < this.n - 1 ? this.slotEnd[i + 1] : 1;
     max -= this.minSizesArr[i + 1];
     max = Math.min(max, start + this.maxSizesArr[i]);
+
+    console.log('resize', {
+      min,
+      max,
+      start
+    });
 
     let frac: number;
     let rect = this.el.getBoundingClientRect();
