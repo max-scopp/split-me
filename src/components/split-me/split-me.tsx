@@ -5,11 +5,14 @@ import {
   Watch,
   Element,
   Event,
-  EventEmitter
+  EventEmitter,
+  h
 } from '@stencil/core';
 
 import { Cancelable } from 'lodash';
 import throttle from 'lodash.throttle';
+
+import { IResizeEvent } from './interfaces';
 
 @Component({
   tag: 'split-me',
@@ -20,26 +23,59 @@ export class SplitMe {
   @Element()
   el: HTMLElement;
 
+  /**
+   * The number of slots in the splitter.
+   */
   @Prop()
   n: number = 1;
+
+  /**
+   * The direction of the splitter.
+   */
   @Prop()
-  d: 'horizontal' | 'vertical';
+  d: 'horizontal' | 'vertical' = 'horizontal';
+
+  /**
+   * Prevent the splitter from being resized.
+   */
   @Prop()
   fixed: boolean = false;
+
+  /**
+   * The initial sizes of the slots.
+   * Acceptable formats are: `sizes="0.33, 0.67"` or `sizes="50%, 25%, 25%"`
+   */
   @Prop()
-  sizes: string = '';
+  sizes: string | number[] = '';
+
+  /**
+   * The minimum sizes of the slots.
+   * Same format as `sizes`
+   */
   @Prop()
-  minSizes: string = '';
+  minSizes: string | number[] = '';
+
+  /**
+   * The maximum sizes of the slots.
+   * Same format as `sizes`
+   */
   @Prop()
-  maxSizes: string = '';
+  maxSizes: string | number[] = '';
+
+  /**
+   * The minimum time (in ms) between resize events while dragging.
+   */
   @Prop()
   throttle: number = 0;
 
   @State()
   slotEnd: number[];
 
+  /**
+   * Emitted every time dragging causes the slots to resize
+   */
   @Event()
-  slotResized: EventEmitter;
+  slotResized: EventEmitter<IResizeEvent>;
 
   @Watch('n')
   watchN() {
@@ -190,10 +226,37 @@ export class SplitMe {
     return maxSizes;
   }
 
-  parseSizes(sizesStr: string): number[] {
+  parseSizes(sizesStr: string | number[]): number[] {
     if (!sizesStr) {
       return [];
     }
+
+    // If sizes prop is array
+
+    if (Array.isArray(sizesStr)) {
+      if (sizesStr.length === this.n) {
+        return sizesStr;
+      } else {
+        return [];
+      }
+    }
+
+    // If sizes prop is stringified array
+
+    try {
+      const parsed = JSON.parse(sizesStr);
+      if (Array.isArray(parsed)) {
+        if (parsed.length === this.n) {
+          return parsed;
+        } else {
+          return [];
+        }
+      }
+    } catch (e) {}
+
+    // If sizes prop is freeform string such as
+    // '0.5, 0.25, 0.25' or '50%, 50%'
+
     let sizesStrArr: string[] = sizesStr.split(',');
     if (sizesStrArr.length !== this.n) {
       return [];
@@ -219,13 +282,18 @@ export class SplitMe {
     // Firefox wouldn't allow using drag events for resizing purposes,
     // use this workaround instead.
     event.preventDefault();
-    let mouseMoveListener = (e: MouseEvent) => {
-      this.throttledResize(e.clientX, e.clientY, i);
+
+    const mouseMoveListener = (e: MouseEvent) => {
+      this.throttledResize(e.clientX, e.clientY, i, e);
     };
-    window.addEventListener('mousemove', mouseMoveListener);
-    window.addEventListener('mouseup', () => {
+
+    const mouseUpListener = () => {
       window.removeEventListener('mousemove', mouseMoveListener);
-    });
+      window.removeEventListener('mouseup', mouseUpListener);
+    };
+
+    window.addEventListener('mousemove', mouseMoveListener);
+    window.addEventListener('mouseup', mouseUpListener);
   }
 
   onTouchMove = (event: TouchEvent, i: number) => {
@@ -236,12 +304,13 @@ export class SplitMe {
       this.throttledResize(
         event.touches[0].clientX,
         event.touches[0].clientY,
-        i
+        i,
+        event
       );
     }
   };
 
-  resize(x: number, y: number, i: number) {
+  resize(x: number, y: number, i: number, e: MouseEvent | TouchEvent) {
     let start = i > 0 ? this.slotEnd[i - 1] : 0;
     let min = start + this.minSizesArr[i];
     min = Math.max(min, this.slotEnd[i + 1] - this.maxSizesArr[i + 1]);
@@ -258,21 +327,48 @@ export class SplitMe {
       frac = (x - rect.left) / rect.width;
     }
 
-    if (frac > min && frac < max) {
+    let doResize: boolean = false;
+    if (frac < min) {
+      if (this.slotEnd[i] > min) {
+        frac = min;
+        doResize = true;
+      }
+    } else if (frac > max) {
+      if (this.slotEnd[i] < max) {
+        frac = max;
+        doResize = true;
+      }
+    } else {
+      doResize = true;
+    }
+
+    if (doResize) {
       this.slotEnd = [
         ...this.slotEnd.slice(0, i),
         frac,
         ...this.slotEnd.slice(i + 1)
       ];
-      this.slotResized.emit(i);
+      this.slotResized.emit({
+        divider: i,
+        sizes: this.slotEndToSizes(this.slotEnd),
+        originalEvent: e
+      });
     }
   }
 
-  getSlotSize(i: number): number {
+  slotEndToSizes(slotEnd: number[]): number[] {
+    const sizes: number[] = [];
+    for (let i = 0; i < slotEnd.length; ++i) {
+      sizes.push(this.getSlotSize(i, slotEnd));
+    }
+    return sizes;
+  }
+
+  getSlotSize(i: number, slotEnd: number[]): number {
     if (i === 0) {
-      return this.slotEnd[i];
+      return slotEnd[i];
     } else {
-      return this.slotEnd[i] - this.slotEnd[i - 1];
+      return slotEnd[i] - slotEnd[i - 1];
     }
   }
 
@@ -288,7 +384,7 @@ export class SplitMe {
     for (let i = 0; i < this.n; ++i) {
       let containerId = `container${i}`;
       let slotName = `${i}`;
-      let size: number = this.getSlotSize(i);
+      let size: number = this.getSlotSize(i, this.slotEnd);
       let style;
       if (this.d === 'vertical') {
         style = { width: '100%', height: `${size * 100}%` };
